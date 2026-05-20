@@ -12,10 +12,20 @@ def _results_dir() -> Path:
     return Path.home() / ".tradingagents" / "logs"
 
 
+def _lookup_name(ticker: str) -> str:
+    """Resolve ticker code to Chinese company name. Empty on failure."""
+    try:
+        from tradingagents.dataflows.a_stock import _build_name_code_map
+        _, code_to_name = _build_name_code_map()
+        return code_to_name.get(ticker, "") if code_to_name else ""
+    except Exception:
+        return ""
+
+
 def get_history() -> list[dict[str, str]]:
     """Scan saved analysis logs and return a sorted list (newest first).
 
-    Each entry: {"ticker": "300750", "date": "2026-05-12", "path": "/abs/path/...json"}
+    Each entry: {"ticker": "300750", "name": "宁德时代", "date": "2026-05-12", "path": ".../json"}
     """
     root = _results_dir()
     if not root.exists():
@@ -28,7 +38,12 @@ def get_history() -> list[dict[str, str]]:
             continue
         date = match.group(1)
         ticker = log_file.parent.parent.name
-        entries.append({"ticker": ticker, "date": date, "path": str(log_file)})
+        entries.append({
+            "ticker": ticker,
+            "name": _lookup_name(ticker),
+            "date": date,
+            "path": str(log_file),
+        })
 
     entries.sort(key=lambda e: e["date"], reverse=True)
     return entries

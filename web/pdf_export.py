@@ -69,8 +69,8 @@ class _ReportPDF(FPDF):
 
         font_path = _find_cjk_font()
         if font_path:
-            self.add_font("CJK", "", font_path, uni=True)
-            self.add_font("CJK", "B", font_path, uni=True)
+            self.add_font("CJK", "", font_path)
+            self.add_font("CJK", "B", font_path)
             self._has_cjk = True
 
     def _use_font(self, style: str = "", size: int = 10) -> None:
@@ -146,6 +146,8 @@ class _ReportPDF(FPDF):
         lines = text.split("\n")
         i = 0
         while i < len(lines):
+            # fpdf2 2.8.x: cell(0,h)+ln() leaves x at right edge; force reset.
+            self.set_x(self.l_margin)
             line = lines[i]
             stripped = line.strip()
 
