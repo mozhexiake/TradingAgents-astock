@@ -244,22 +244,34 @@ def _ths_eps_forecast(code: str) -> pd.DataFrame:
     """Fetch consensus EPS forecast from 同花顺 (direct HTTP).
 
     Returns DataFrame with columns roughly: 年度, 预测机构数, 最小值, 均值, 最大值.
+    Returns empty DataFrame on any failure (without raising; HTML noise was
+    polluting logs because pd.read_html treats raw HTML string as a path
+    when wrapped in non-StringIO form).
     """
+    from io import StringIO
+
     url = f"https://basic.10jqka.com.cn/new/{code}/worth.html"
     headers = {
         "User-Agent": _UA,
         "Referer": "https://basic.10jqka.com.cn/",
     }
-    r = _requests.get(url, headers=headers, timeout=15)
-    r.encoding = "gbk"
-    dfs = pd.read_html(r.text)
-    # Find the table containing EPS data
+    try:
+        r = _requests.get(url, headers=headers, timeout=15)
+        r.encoding = "gbk"
+        # StringIO 包装避免 pandas 把 HTML 当 file path → 错误信息 dump 整个 HTML
+        dfs = pd.read_html(StringIO(r.text))
+    except (ValueError, Exception) as e:
+        # ValueError: pandas 解析无表格 / 其它网络错误
+        logger.debug("ths eps forecast unavailable for %s: %s", code, type(e).__name__)
+        return pd.DataFrame()
+
+    if not dfs:
+        return pd.DataFrame()
     for df in dfs:
         cols = [str(c) for c in df.columns]
         if any("每股收益" in c or "均值" in c for c in cols):
             return df
-    # Fallback: return first table if exists
-    return dfs[0] if dfs else pd.DataFrame()
+    return dfs[0]
 
 
 # ---------------------------------------------------------------------------
@@ -365,13 +377,14 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
         df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
         df["Date"] = pd.to_datetime(df["Date"])
     except Exception as e:
-        logger.warning("mootdx OHLCV failed for %s: %s, trying sina HTTP fallback", code, e)
-        # Fallback: Sina direct HTTP API
+        # 降级到 DEBUG：fallback 是预期路径；ERROR 只在两个源都挂时打
+        logger.debug("mootdx OHLCV failed for %s, fallback to sina: %s", code, e)
         try:
             df = _sina_kline_fallback(code)
             if df.empty:
                 raise ValueError(f"No OHLCV data from sina for {code}")
         except Exception:
+            logger.error("OHLCV exhausted (mootdx+sina) for %s", code)
             raise ValueError(f"No OHLCV data from mootdx/sina for {code}")
 
     # Cache to disk
@@ -426,14 +439,15 @@ def get_stock_data(
         df["Date"] = pd.to_datetime(df["Date"])
 
     except Exception as e:
-        logger.warning("mootdx K-line failed for %s: %s, trying sina HTTP fallback", code, e)
-        # Fallback: Sina direct HTTP API
+        logger.debug("mootdx K-line failed for %s, fallback to sina: %s", code, e)
         try:
             df = _sina_kline_fallback(code, start_date, end_date)
             if df.empty:
+                logger.error("K-line exhausted (mootdx+sina) for %s", code)
                 return "K线数据获取失败：mootdx和新浪备用源均不可用，请检查网络连接"
             data_source = "sina HTTP (fallback)"
         except Exception:
+            logger.error("K-line exhausted (mootdx+sina) for %s", code)
             return "K线数据获取失败：mootdx和新浪备用源均不可用，请检查网络连接"
 
     # Filter by date range

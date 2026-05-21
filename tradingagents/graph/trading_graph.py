@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, List, Optional
 
-import yfinance as yf
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -229,30 +229,41 @@ class TradingAgentsGraph:
     ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
         """Fetch raw and alpha return for ticker over holding_days from trade_date.
 
+        Uses mootdx (TCP 通达信协议) for both the A-stock and the CSI 300
+        benchmark — yfinance is unreliable for A-shares (often returns empty
+        data), which caused reflection entries to stay pending forever.
+
         Returns (raw_return, alpha_return, actual_holding_days) or
         (None, None, None) if price data is unavailable (too recent, delisted,
         or network error).
         """
         try:
-            start = datetime.strptime(trade_date, "%Y-%m-%d")
-            end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
-            end_str = end.strftime("%Y-%m-%d")
+            from mootdx.quotes import Quotes
+            client = Quotes.factory(market="std")
 
-            stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
-            benchmark = yf.Ticker("000300.SS").history(start=trade_date, end=end_str)
+            def _close_series(symbol: str, market: int, is_index: bool = False) -> list[float]:
+                """拉最近 800 个交易日 K 线，过滤到 trade_date 之后。"""
+                fetch = client.index_bars if is_index else client.bars
+                bars = fetch(symbol=symbol, frequency=9, offset=800, market=market)
+                if bars is None or bars.empty:
+                    return []
+                bars = bars.copy()
+                bars["date"] = pd.to_datetime(bars["datetime"]).dt.strftime("%Y-%m-%d")
+                bars = bars[bars["date"] >= trade_date].sort_values("date")
+                return bars["close"].tolist()
 
-            if len(stock) < 2 or len(benchmark) < 2:
+            # ticker market：6/9 开头是上海，其它是深圳
+            stock_market = 1 if ticker.startswith(("6", "9")) else 0
+            stock_closes = _close_series(ticker, stock_market, is_index=False)
+            # CSI 300 = 000300，必须走 index_bars（不是 bars）
+            bench_closes = _close_series("000300", 1, is_index=True)
+
+            if len(stock_closes) < 2 or len(bench_closes) < 2:
                 return None, None, None
 
-            actual_days = min(holding_days, len(stock) - 1, len(benchmark) - 1)
-            raw = float(
-                (stock["Close"].iloc[actual_days] - stock["Close"].iloc[0])
-                / stock["Close"].iloc[0]
-            )
-            bench_ret = float(
-                (benchmark["Close"].iloc[actual_days] - benchmark["Close"].iloc[0])
-                / benchmark["Close"].iloc[0]
-            )
+            actual_days = min(holding_days, len(stock_closes) - 1, len(bench_closes) - 1)
+            raw = float((stock_closes[actual_days] - stock_closes[0]) / stock_closes[0])
+            bench_ret = float((bench_closes[actual_days] - bench_closes[0]) / bench_closes[0])
             alpha = raw - bench_ret
             return raw, alpha, actual_days
         except Exception as e:
