@@ -48,6 +48,62 @@ RATING_KEYWORDS = [
 ]
 
 
+def _first_price(text: str, patterns: list[str]) -> Optional[float]:
+    """按 patterns 顺序匹配第一个合理价格（>0 且 < 10000）。"""
+    for pat in patterns:
+        for m in re.finditer(pat, text):
+            try:
+                p = float(m.group(1))
+                if 0.5 < p < 10000:
+                    return p
+            except (ValueError, IndexError):
+                continue
+    return None
+
+
+def extract_prices(report: str) -> tuple[Optional[float], Optional[float]]:
+    """从 LLM 报告里提取 (target_price, stop_loss)。
+
+    覆盖模式：
+        止损: "止损位 29" / "止损设在 29 元" / "跌破 29 元止损" / "下方支撑 29 元"
+        目标: "目标价 33.5" / "上方压力位 33.5" / "上涨至 33.5" / "反弹至 33.5"
+    """
+    if not report:
+        return None, None
+
+    # 优先匹配 【操作建议】段（精度最高）
+    sec = re.search(r"【操作建议】(.+?)(?=【|$)", report, re.DOTALL)
+    op_text = sec.group(1) if sec else ""
+
+    # 止损相关
+    stop_patterns = [
+        r"止损位?[设于在为：:]*\s*[¥￥]?\s*(\d+\.?\d*)",
+        r"止损线?[设于在为：:]*\s*[¥￥]?\s*(\d+\.?\d*)",
+        r"硬性?止损位?[设于在为：:]*\s*[¥￥]?\s*(\d+\.?\d*)",
+        r"跌破\s*[¥￥]?\s*(\d+\.?\d*)\s*元?[（(]?[^）)]{0,30}[）)]?\s*(?:则|止损|清仓|离场|出局|止损线)",
+        r"下方支撑位?[在为：:]*\s*[¥￥]?\s*(\d+\.?\d*)",
+    ]
+    # 目标相关
+    target_patterns = [
+        r"目标价?[为是设于：:]*\s*[¥￥]?\s*(\d+\.?\d*)",
+        r"上方压力位?[在为：:]*\s*[¥￥]?\s*(\d+\.?\d*)",
+        r"上涨空间[^至]*至\s*[¥￥]?\s*(\d+\.?\d*)",
+        r"反弹至\s*[¥￥]?\s*(\d+\.?\d*)",
+        r"突破\s*[¥￥]?\s*(\d+\.?\d*)\s*元?[（(]?[^）)]{0,30}[）)]?\s*(?:加仓|跟进|确认|前高)",
+        r"站稳\s*[¥￥]?\s*(\d+\.?\d*)",
+    ]
+
+    # 优先操作建议段，否则全文
+    stop = _first_price(op_text, stop_patterns) or _first_price(report, stop_patterns)
+    target = _first_price(op_text, target_patterns) or _first_price(report, target_patterns)
+
+    # 防止"目标 = 止损"（regex 误吞）
+    if stop is not None and target is not None and stop == target:
+        target = None
+
+    return target, stop
+
+
 def extract_rating(report: str) -> tuple[Optional[str], Optional[str]]:
     """从 LLM 报告里提取 (rating, action) 。
 
@@ -144,14 +200,36 @@ def fetch_holding_data(ticker: str, end_date: str) -> dict:
     }
 
 
-def analyze_one(client: OpenAI, holding: dict, current_price: float, end_date: str) -> dict:
-    """对单只持仓票做一次 L2 分析。返回 {rating, action, report, ...}"""
+def analyze_one(client: OpenAI, holding: dict, current_price: float, end_date: str,
+                use_cache: bool = True) -> dict:
+    """对单只持仓票做一次 L2 分析。返回 {rating, action, report, ...}
+
+    use_cache=True 时：当日同 ticker+level 已有结果直接返回（省 ¥）
+    """
     ticker = holding["ticker"]
     name = holding["name"]
     cost = holding["cost_price"]
     qty = holding["qty"]
     pnl_pct = (current_price - cost) / cost * 100 if cost > 0 else 0
     market_value = qty * current_price
+
+    # 缓存：当日已有 L2 结果直接返回
+    if use_cache:
+        from astockboard.storage.db import get_db
+        row = get_db().execute(
+            """SELECT rating, action, report, cost_yuan FROM analysis_result
+               WHERE ticker=? AND date=? AND level='L2'""",
+            (ticker, end_date),
+        ).fetchone()
+        if row and row["report"]:
+            logger.info("cache hit for %s on %s (saved ¥%.4f)", ticker, end_date, row["cost_yuan"] or 0)
+            return {
+                "ticker": ticker, "name": name,
+                "price": current_price, "pnl_pct": pnl_pct,
+                "report": row["report"], "rating": row["rating"],
+                "action": row["action"], "cost_yuan": 0.0,  # 0 = cache hit
+                "cache_hit": True,
+            }
 
     # 拉数据
     data = fetch_holding_data(ticker, end_date)
@@ -173,6 +251,7 @@ def analyze_one(client: OpenAI, holding: dict, current_price: float, end_date: s
     )
     report = resp.choices[0].message.content
     rating, action = extract_rating(report)
+    target_price, stop_loss = extract_prices(report)
 
     # 估算成本（粗略）：input + output token，按 deepseek-chat 定价
     usage = resp.usage
@@ -189,6 +268,8 @@ def analyze_one(client: OpenAI, holding: dict, current_price: float, end_date: s
         "report": report,
         "rating": rating,
         "action": action,
+        "target_price": target_price,
+        "stop_loss": stop_loss,
         "cost_yuan": cost_yuan,
     }
 
@@ -252,7 +333,8 @@ def run(end_date: Optional[str] = None, alert_on_change: bool = True) -> dict:
         save_analysis(
             ticker=ticker, date=end_date, level="L2", model="deepseek-chat",
             rating=result["rating"], action=result["action"],
-            target_price=None, stop_loss=None,
+            target_price=result.get("target_price"),
+            stop_loss=result.get("stop_loss"),
             report=result["report"],
             meta={"price": current_price, "pnl_pct": result["pnl_pct"]},
             cost_yuan=result["cost_yuan"],
