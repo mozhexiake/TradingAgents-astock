@@ -105,34 +105,71 @@ def extract_prices(report: str) -> tuple[Optional[float], Optional[float]]:
 
 
 def extract_rating(report: str) -> tuple[Optional[str], Optional[str]]:
-    """从 LLM 报告里提取 (rating, action) 。
+    """从 LLM 报告里提取 (rating, action)。
 
     rating: 重点关注 / 中性观察 / 暂不参与 / 止损（4 档简化）
     action: 完整动作描述
+
+    策略（顺序）：
+    1. 【操作建议】段开头 30 字符内的加粗标签 ⭐ —— 最高优先级
+    2. 【操作建议】段中第一个出现的标签
+    3. 全文第一个出现的加粗标签
+    4. 全文第一个出现的标签
     """
     if not report:
         return None, None
 
-    # 优先匹配 【操作建议】部分
-    sec = re.search(r"【操作建议】\s*\*?\*?(.+?)(?=\n\n|$)", report, re.DOTALL)
-    text = sec.group(1) if sec else report
+    LABELS = ("止损出局", "暂不参与", "中性观察", "重点关注")
+    LABEL_TO_RATING = {
+        "止损出局": ("止损", "止损出局"),
+        "暂不参与": ("暂不参与", "暂不参与"),
+        "中性观察": ("中性观察", "中性观察"),
+        "重点关注": ("重点关注", "重点关注"),
+    }
 
-    # 按优先级匹配关键字
-    if re.search(r"\*\*(止损出局|止损)\*\*", text) or "止损出局" in text:
-        return "止损", "止损出局"
-    if re.search(r"\*\*暂不参与\*\*", text) or "暂不参与" in text:
-        return "暂不参与", "暂不参与"
-    if re.search(r"\*\*重点关注\*\*", text) or "重点关注" in text:
-        return "重点关注", "重点关注"
-    if re.search(r"\*\*中性观察\*\*", text) or "中性观察" in text:
-        return "中性观察", "中性观察"
+    sec = re.search(r"【操作建议】\s*\*?\*?(.+?)(?=【|$)", report, re.DOTALL)
+    op_text = sec.group(1) if sec else ""
 
-    # Fallback
-    if "分批止盈" in text or "减仓" in text:
+    def _first_label(text: str, must_bold: bool = False) -> Optional[str]:
+        """文本里第一个出现的标签（按位置而非优先级）。"""
+        best_pos = None
+        best_label = None
+        for lab in LABELS:
+            pat = rf"\*\*{lab}\*\*" if must_bold else lab
+            m = re.search(pat, text)
+            if m and (best_pos is None or m.start() < best_pos):
+                best_pos = m.start()
+                best_label = lab
+        return best_label
+
+    # 1. 操作建议段开头加粗标签（最强信号）
+    if op_text:
+        head = op_text[:50]
+        lab = _first_label(head, must_bold=True)
+        if lab:
+            return LABEL_TO_RATING[lab]
+
+    # 2. 操作建议段第一个出现的标签（位置优先）
+    if op_text:
+        lab = _first_label(op_text, must_bold=False)
+        if lab:
+            return LABEL_TO_RATING[lab]
+
+    # 3. 全文第一个加粗标签
+    lab = _first_label(report, must_bold=True)
+    if lab:
+        return LABEL_TO_RATING[lab]
+
+    # 4. 全文第一个标签
+    lab = _first_label(report, must_bold=False)
+    if lab:
+        return LABEL_TO_RATING[lab]
+
+    # 5. 模糊匹配兜底
+    if "分批止盈" in report or "减仓" in report:
         return "中性观察", "分批止盈/减仓"
-    if "加仓" in text or "买入" in text:
+    if "加仓" in report or "买入" in report:
         return "重点关注", "建议加仓/买入"
-
     return None, None
 
 
