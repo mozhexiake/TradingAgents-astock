@@ -11,6 +11,11 @@ from openai import OpenAI
 from astockboard.config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL
 from astockboard.data.router import get_router
 from astockboard.notify.bark import send_rating_alert
+from astockboard.monitor.rating_churn import (
+    extract_confidence,
+    is_critical_reversal,
+    smooth_rating,
+)
 from astockboard.storage import init_db
 from astockboard.storage.repos import (
     get_latest_analysis,
@@ -377,24 +382,48 @@ def run(end_date: Optional[str] = None, alert_on_change: bool = True) -> dict:
             cost_yuan=result["cost_yuan"],
         )
 
-        # 评级变化检测
+        # P1-6 rating churn 3 件套：confidence 提取 + 3 日多数决 + L3 反转告警
+        raw_rating = result["rating"]
+        confidence = extract_confidence(result.get("report"))
+        if raw_rating:
+            try:
+                from astockboard.storage.db import get_db
+                smoothed_rating, churn_reason = smooth_rating(
+                    get_db(), ticker, end_date, raw_rating, confidence=confidence,
+                )
+                if smoothed_rating != raw_rating:
+                    print(f"  📊 churn 平滑: {raw_rating} → {smoothed_rating} ({churn_reason})")
+            except Exception as e:
+                logger.warning("rating_churn smoothing failed for %s: %s", ticker, e)
+                smoothed_rating, churn_reason = raw_rating, f"error: {e}"
+        else:
+            smoothed_rating, churn_reason = raw_rating, "no raw rating"
+
+        # 评级变化检测（用平滑后评级）
         old_rating = h.get("last_rating")
-        new_rating = result["rating"]
+        new_rating = smoothed_rating
         if alert_on_change and new_rating and old_rating and new_rating != old_rating:
-            print(f"  🚨 评级变化: {old_rating} → {new_rating}")
+            critical = is_critical_reversal(old_rating, new_rating)
+            tag = "🚨🔁 L3 建议" if critical else "🚨 评级变化"
+            print(f"  {tag}: {old_rating} → {new_rating}"
+                  + (f" (conf={confidence:.2f})" if confidence is not None else "")
+                  + f" [{churn_reason}]")
             send_rating_alert(
                 ticker=ticker, name=name,
                 old_rating=old_rating, new_rating=new_rating,
-                action=result["action"] or "-",
+                action=(("[需 L3 二审] " if critical else "") + (result["action"] or "-")),
                 price=current_price, pnl_pct=result["pnl_pct"],
                 report_snippet=result["report"], date=end_date,
             )
             changes.append({
                 "ticker": ticker, "name": name,
                 "old": old_rating, "new": new_rating,
+                "raw": raw_rating, "smoothed": smoothed_rating,
+                "confidence": confidence, "critical_reversal": critical,
+                "churn_reason": churn_reason,
             })
 
-        # 更新持仓表的最新评级
+        # 更新持仓表的最新评级（用平滑后值）
         if new_rating:
             update_holding_rating(ticker, new_rating)
 
