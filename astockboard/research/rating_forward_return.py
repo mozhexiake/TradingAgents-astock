@@ -46,14 +46,21 @@ def _fetch_close_prices(ticker: str, start_date: str,
             from mootdx.quotes import Quotes
             client = Quotes.factory(market="std")
             df = client.bars(symbol=ticker, frequency=9,
-                              offset=horizon_days * 3 + 10)
+                              offset=horizon_days * 3 + 30)
             if df is None or df.empty:
                 return []
             out = []
-            for _, row in df.iterrows():
-                date_str = str(row.get("datetime", ""))[:10]
-                if date_str >= start_date:
-                    out.append((date_str, float(row.get("close", 0))))
+            # datetime 在 index 或 column
+            for idx, row in df.iterrows():
+                # 取 datetime: 先看 column，否则用 index
+                dt = row.get("datetime") if "datetime" in df.columns else idx
+                date_str = str(dt)[:10]
+                close = row.get("close")
+                if date_str and close is not None and date_str >= start_date:
+                    try:
+                        out.append((date_str, float(close)))
+                    except (TypeError, ValueError):
+                        continue
             return sorted(out)
         except Exception as e:
             print(f"  mootdx fail {ticker}: {e}")
