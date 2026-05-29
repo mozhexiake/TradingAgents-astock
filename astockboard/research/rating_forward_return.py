@@ -33,54 +33,43 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from astockboard.storage.db import get_db
 
 
+_PRICE_CACHE: dict[str, list[tuple[str, float]]] = {}
+
+
 def _fetch_close_prices(ticker: str, start_date: str,
                         horizon_days: int) -> list[tuple[str, float]]:
-    """拉 ticker 在 start_date 起的 horizon_days+ buffer 天 close 价。"""
-    try:
-        from tradingagents.dataflows.a_stock import (
-            get_stock_data as _get_stock,
-        )
-    except Exception:
-        # 退化：直接从 mootdx 拉
+    """拉 ticker 在 start_date 起的 horizon_days+ buffer 天 close 价（mootdx 直连）。
+
+    缓存：相同 ticker 整段历史只拉一次。
+    """
+    if ticker in _PRICE_CACHE:
+        all_prices = _PRICE_CACHE[ticker]
+    else:
         try:
             from mootdx.quotes import Quotes
             client = Quotes.factory(market="std")
-            df = client.bars(symbol=ticker, frequency=9,
-                              offset=horizon_days * 3 + 30)
+            df = client.bars(symbol=ticker, frequency=9, offset=200)
             if df is None or df.empty:
+                _PRICE_CACHE[ticker] = []
                 return []
             out = []
-            # datetime 在 index 或 column
             for idx, row in df.iterrows():
-                # 取 datetime: 先看 column，否则用 index
                 dt = row.get("datetime") if "datetime" in df.columns else idx
                 date_str = str(dt)[:10]
                 close = row.get("close")
-                if date_str and close is not None and date_str >= start_date:
+                if date_str and close is not None:
                     try:
                         out.append((date_str, float(close)))
                     except (TypeError, ValueError):
                         continue
-            return sorted(out)
+            all_prices = sorted(out)
+            _PRICE_CACHE[ticker] = all_prices
         except Exception as e:
             print(f"  mootdx fail {ticker}: {e}")
+            _PRICE_CACHE[ticker] = []
             return []
-    # 走 tradingagents 接口
-    try:
-        df = _get_stock(ticker, start_date,
-                        (datetime.fromisoformat(start_date) +
-                         timedelta(days=horizon_days * 2 + 10)).strftime("%Y-%m-%d"))
-        out = []
-        if hasattr(df, "iterrows"):
-            for _, row in df.iterrows():
-                date_str = str(row.get("date") or row.get("trade_date") or "")[:10]
-                close = row.get("close") or row.get("收盘")
-                if date_str and close is not None:
-                    out.append((date_str, float(close)))
-        return sorted(out)
-    except Exception as e:
-        print(f"  tradingagents fail {ticker}: {e}")
-        return []
+    # 过滤 ≥ start_date
+    return [p for p in all_prices if p[0] >= start_date]
 
 
 def compute_forward_return(ticker: str, rating_date: str,
